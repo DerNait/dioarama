@@ -1,11 +1,11 @@
 use crate::material::Material;
-use crate::math::{Vec3, Ray, EPS};
+use crate::math::{Vec3, Ray};
 use crate::object::{Hittable, HitRecord};
 
-/// Plano infinito definido por un punto y una normal
+/// Plano infinito (punto + normal)
 pub struct Plane {
     pub point: Vec3,
-    pub normal: Vec3, // normalizada
+    pub normal: Vec3,
     pub material: Material,
 }
 
@@ -24,13 +24,7 @@ impl Hittable for Plane {
         if t < t_min || t > t_max { return None; }
 
         let p = ray.at(t);
-        let n = if denom < 0.0 { self.normal } else { -self.normal }; // apuntar contra el rayo
-
-        Some(HitRecord {
-            t,
-            point: p,
-            normal: n,
-            material: self.material,
-        })
+        let n = if denom < 0.0 { self.normal } else { -self.normal };
+        Some(HitRecord { t, point: p, normal: n, material: self.material })
     }
 }

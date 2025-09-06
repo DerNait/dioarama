@@ -5,11 +5,11 @@ use crate::math::{Ray, Vec3};
 pub struct HitRecord {
     pub t: f32,
     pub point: Vec3,
-    pub normal: Vec3,   // normalizada, saliendo del objeto
+    pub normal: Vec3,   // unitario, saliendo del objeto
     pub material: Material,
 }
 
 pub trait Hittable {
-    /// Intersección del rayo en [t_min, t_max]. Devuelve el hit más cercano.
+    /// Intersección del rayo en [t_min, t_max]. Devuelve el hit más cercano de este objeto.
     fn intersect(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord>;
 }

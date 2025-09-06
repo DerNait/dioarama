@@ -1,0 +1,529 @@
+src\camera.rs:
+use crate::math::{Vec3, Ray};
+
+pub struct Camera {
+    pub eye: Vec3,
+    pub center: Vec3,
+    pub up: Vec3,
+    pub right: Vec3,
+    pub forward: Vec3,
+    pub true_up: Vec3,
+    pub fov_y_deg: f32,
+    pub aspect: f32,
+}
+
+impl Camera {
+    pub fn new(eye: Vec3, center: Vec3, up: Vec3, fov_y_deg: f32, aspect: f32) -> Self {
+        let forward = (center - eye).normalized();
+        let right = forward.cross(up).normalized();
+        let true_up = right.cross(forward).normalized();
+        Self { eye, center, up, right, forward, true_up, fov_y_deg, aspect }
+    }
+
+    pub fn ray_for_pixel_offset(&self, px: i32, py: i32, w: i32, h: i32, ox: f32, oy: f32) -> Ray {
+        // ox, oy en [0,1): desplazamiento sub-píxel
+        let x = ((px as f32 + ox) / w as f32) * 2.0 - 1.0;
+        let y = 1.0 - ((py as f32 + oy) / h as f32) * 2.0;
+
+        let fov_scale = (self.fov_y_deg.to_radians() * 0.5).tan();
+        let sx = x * self.aspect * fov_scale;
+        let sy = y * fov_scale;
+
+        let dir = (self.right * sx + self.true_up * sy + self.forward).normalized();
+        Ray::new(self.eye, dir)
+    }
+
+    // Mantén compatibilidad: centro del píxel (0.5, 0.5)
+    pub fn ray_for_pixel(&self, px: i32, py: i32, w: i32, h: i32) -> Ray {
+        self.ray_for_pixel_offset(px, py, w, h, 0.5, 0.5)
+    }
+}
+
+src\light.rs:
+use crate::math::Vec3;
+
+pub struct PointLight {
+    pub position: Vec3,
+    pub color: Vec3,
+    pub intensity: f32,
+}
+
+src\main.rs:
+use raylib::prelude::*;
+
+mod math;
+mod camera;
+mod orbit;
+mod light;
+mod material;
+mod object;
+mod render;
+mod objects;
+
+use camera::Camera;
+use light::PointLight;
+use material::{Material, presets};
+use math::{Vec3, clamp01};
+use object::Hittable;
+use objects::{cube::Cube, plane::Plane};
+use orbit::OrbitCamera;
+use render::trace_pixel;
+
+fn main() {
+    const WIDTH: i32 = 500;
+    const HEIGHT: i32 = 400;
+    const SCALE: i32 = 2;
+
+    let (mut rl, thread) = raylib::init()
+        .size(WIDTH * SCALE, HEIGHT * SCALE)
+        .title("Ray Tracing (CPU+raylib) - Cube • Materials • ZBuffer • OrbitCam")
+        .build();
+
+    rl.set_target_fps(30);
+
+    // ------- Orbit Camera -------
+    let mut orbit = OrbitCamera::new(
+        Vec3::new(0.0, 1.0, 0.0), // center
+        4.0,                      // radius
+        0.0_f32.to_radians(),     // yaw
+        12.0_f32.to_radians(),    // pitch
+    );
+    let fov_y_deg = 60.0;
+    let aspect = WIDTH as f32 / HEIGHT as f32;
+
+    // ------- Luz -------
+    let light = PointLight {
+        position: Vec3::new(3.0, 5.0, 2.0),
+        color: Vec3::splat(1.0),
+        intensity: 1.5,
+    };
+
+    // ------- Materiales -------
+    let mat_cube = Material {
+        albedo: Vec3::new(0.82, 0.18, 0.18),
+        ks: 0.45,
+        shininess: 32.0,
+        ka: 0.08,
+    };
+    let mat_floor = presets::light_gray();
+
+    // ------- Objetos -------
+    let cube = Cube::new(Vec3::new(0.0, 1.0, 0.0), Vec3::splat(0.75), mat_cube);
+    let floor = Plane::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), mat_floor);
+
+    let mut world: Vec<Box<dyn Hittable + Send + Sync>> = Vec::new();
+    world.push(Box::new(cube));
+    world.push(Box::new(floor));
+
+    // ------- ZBuffer -------
+    let mut zbuffer: Vec<f32> = vec![math::INF; (WIDTH * HEIGHT) as usize];
+
+    while !rl.window_should_close() {
+        // Input orbit
+        orbit.update_from_input(&rl);
+
+        // ✅ Generar cámara para el frame (línea corregida)
+        let camera: Camera = orbit.to_camera(fov_y_deg, aspect);
+
+        let mut d = rl.begin_drawing(&thread);
+        d.clear_background(Color::BLACK);
+
+        // Limpia zbuffer
+        for z in &mut zbuffer { *z = math::INF; }
+
+        // Ray cast por píxel
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let idx = (y * WIDTH + x) as usize;
+                let color_lin = trace_pixel(
+                    x, y, WIDTH, HEIGHT,
+                    &camera, &world, &light,
+                    &mut zbuffer, idx
+                );
+
+                // gamma-correct (sRGB aprox): out = pow(color, 1/2.2)
+                let gamma = 1.0 / 2.2;
+                let color = Vec3::new(
+                    color_lin.x.powf(gamma),
+                    color_lin.y.powf(gamma),
+                    color_lin.z.powf(gamma),
+                );
+
+                let r = (clamp01(color.x) * 255.0) as u8;
+                let g = (clamp01(color.y) * 255.0) as u8;
+                let b = (clamp01(color.z) * 255.0) as u8;
+                d.draw_rectangle(x * SCALE, y * SCALE, SCALE, SCALE, Color::new(r, g, b, 255));
+            }
+        }
+
+        // HUD
+        d.draw_text("Orbit: arrastra con el mouse • Zoom: rueda", 10, 10, 18, Color::WHITE);
+        d.draw_text(
+            &format!("yaw {:.1}°  pitch {:.1}°  radius {:.2}",
+                orbit.yaw.to_degrees(), orbit.pitch.to_degrees(), orbit.radius),
+            10, 32, 18, Color::WHITE,
+        );
+        d.draw_fps(10, 54);
+    }
+}
+
+src\material.rs:
+use crate::math::Vec3;
+
+/// Material “Lambert-Phong”: albedo (difuso), ka (ambiente), ks (especular), shininess
+#[derive(Clone, Copy)]
+pub struct Material {
+    pub albedo: Vec3,   // color base (difuso)
+    pub ks: f32,        // fuerza especular
+    pub shininess: f32, // exponente n
+    pub ka: f32,        // ambiente
+}
+
+pub mod presets {
+    use super::Material;
+    use crate::math::Vec3;
+
+    pub fn light_gray() -> Material {
+        Material { albedo: Vec3::new(0.75, 0.75, 0.75), ks: 0.2, shininess: 8.0, ka: 0.06 }
+    }
+    pub fn rubber_red() -> Material {
+        Material { albedo: Vec3::new(0.6, 0.1, 0.1), ks: 0.1, shininess: 6.0, ka: 0.07 }
+    }
+    pub fn ivory() -> Material {
+        Material { albedo: Vec3::new(0.9, 0.85, 0.75), ks: 0.3, shininess: 18.0, ka: 0.07 }
+    }
+    pub fn chrome() -> Material {
+        Material { albedo: Vec3::new(0.7, 0.7, 0.75), ks: 0.9, shininess: 64.0, ka: 0.03 }
+    }
+}
+
+src\math.rs:
+use std::ops::{Add, Sub, Mul, Div, Neg};
+
+pub const EPS: f32 = 1e-4;
+pub const INF: f32 = 1e30;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Vec3 { pub x: f32, pub y: f32, pub z: f32 }
+
+impl Vec3 {
+    pub fn new(x: f32, y: f32, z: f32) -> Self { Self { x, y, z } }
+    pub fn splat(v: f32) -> Self { Self { x: v, y: v, z: v } }
+
+    pub fn dot(self, o: Self) -> f32 { self.x * o.x + self.y * o.y + self.z * o.z }
+    pub fn cross(self, o: Self) -> Self {
+        Self::new(
+            self.y * o.z - self.z * o.y,
+            self.z * o.x - self.x * o.z,
+            self.x * o.y - self.y * o.x,
+        )
+    }
+    pub fn length(self) -> f32 { self.dot(self).sqrt() }
+    pub fn normalized(self) -> Self { let l = self.length(); if l < EPS { self } else { self / l } }
+    pub fn hadamard(self, o: Self) -> Self { Self::new(self.x*o.x, self.y*o.y, self.z*o.z) }
+    pub fn reflect(i: Self, n: Self) -> Self { i - n * (2.0 * i.dot(n)) }
+}
+
+impl Add for Vec3 { type Output = Self; fn add(self, o: Self) -> Self { Self::new(self.x+o.x, self.y+o.y, self.z+o.z) } }
+impl Sub for Vec3 { type Output = Self; fn sub(self, o: Self) -> Self { Self::new(self.x-o.x, self.y-o.y, self.z-o.z) } }
+impl Mul<f32> for Vec3 { type Output = Self; fn mul(self, s: f32) -> Self { Self::new(self.x*s, self.y*s, self.z*s) } }
+impl Div<f32> for Vec3 { type Output = Self; fn div(self, s: f32) -> Self { Self::new(self.x/s, self.y/s, self.z/s) } }
+impl Neg for Vec3 { type Output = Self; fn neg(self) -> Self { Self::new(-self.x, -self.y, -self.z) } }
+
+#[derive(Copy, Clone, Debug)]
+pub struct Ray { pub origin: Vec3, pub dir: Vec3 }
+impl Ray {
+    pub fn new(origin: Vec3, dir: Vec3) -> Self { Self { origin, dir: dir.normalized() } }
+    pub fn at(&self, t: f32) -> Vec3 { self.origin + self.dir * t }
+}
+
+pub fn clamp01(v: f32) -> f32 { if v < 0.0 { 0.0 } else if v > 1.0 { 1.0 } else { v } }
+
+src\object.rs:
+use crate::material::Material;
+use crate::math::{Ray, Vec3};
+
+#[derive(Clone, Copy)]
+pub struct HitRecord {
+    pub t: f32,
+    pub point: Vec3,
+    pub normal: Vec3,   // unitario, saliendo del objeto
+    pub material: Material,
+}
+
+pub trait Hittable {
+    /// Intersección del rayo en [t_min, t_max]. Devuelve el hit más cercano de este objeto.
+    fn intersect(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord>;
+}
+
+src\orbit.rs:
+use raylib::prelude::RaylibHandle;
+use crate::camera::Camera;
+use crate::math::Vec3;
+
+/// Orbit Camera (yaw, pitch, radius) con entrada de mouse
+pub struct OrbitCamera {
+    pub center: Vec3,
+    pub radius: f32,
+    pub yaw: f32,   // rad
+    pub pitch: f32, // rad
+    sens: f32,
+    zoom_speed: f32,
+}
+
+impl OrbitCamera {
+    pub fn new(center: Vec3, radius: f32, yaw: f32, pitch: f32) -> Self {
+        Self { center, radius, yaw, pitch, sens: 0.008, zoom_speed: 0.15 }
+    }
+
+    pub fn update_from_input(&mut self, rl: &RaylibHandle) {
+        // Arrastrar con botón izquierdo: orbit  (enum correcto)
+        if rl.is_mouse_button_down(raylib::consts::MouseButton::MOUSE_BUTTON_LEFT) {
+            let delta = rl.get_mouse_delta();
+            self.yaw   -= delta.x as f32 * self.sens;
+            self.pitch -= delta.y as f32 * self.sens;
+        }
+        // Clamp pitch (-89°..+89°)
+        let lim = 89.0_f32.to_radians();
+        if self.pitch >  lim { self.pitch =  lim; }
+        if self.pitch < -lim { self.pitch = -lim; }
+
+        // Rueda para zoom (log-smooth)
+        let wheel = rl.get_mouse_wheel_move();
+        if wheel.abs() > 0.0 {
+            let factor = 1.0 - wheel as f32 * self.zoom_speed;
+            self.radius = (self.radius * factor).clamp(0.8, 50.0);
+        }
+    }
+
+    pub fn to_camera(&self, fov_y_deg: f32, aspect: f32) -> Camera {
+        // Esféricas → Cartesianas (r, yaw, pitch)
+        let r = self.radius;
+        let cx = self.center.x;
+        let cy = self.center.y;
+        let cz = self.center.z;
+
+        let eye = Vec3::new(
+            cx + r * self.pitch.cos() * self.yaw.cos(),
+            cy + r * self.pitch.sin(),
+            cz + r * self.pitch.cos() * self.yaw.sin(),
+        );
+        Camera::new(eye, self.center, Vec3::new(0.0, 1.0, 0.0), fov_y_deg, aspect)
+    }
+}
+
+src\render.rs:
+use crate::camera::Camera;
+use crate::light::PointLight;
+use crate::math::{Vec3, Ray, EPS, INF};
+use crate::object::{Hittable, HitRecord};
+
+fn background(dir: Vec3) -> Vec3 {
+    let t = 0.5 * (dir.y + 1.0);
+    let c1 = Vec3::new(0.60, 0.80, 1.00);
+    let c2 = Vec3::new(0.04, 0.05, 0.08);
+    c2 * (1.0 - t) + c1 * t
+}
+
+// Phong: ambiente + difuso + especular, con sombras duras
+fn shade(hit: &HitRecord, cam_pos: Vec3, light: &PointLight, world: &Vec<Box<dyn Hittable + Send + Sync>>) -> Vec3 {
+    let ambient = hit.material.albedo * hit.material.ka;
+
+    // Vector a la luz
+    let to_light = (light.position - hit.point);
+    let dist_to_light = to_light.length();
+    let l_dir = to_light / dist_to_light;
+
+    // Shadow ray (evita acne con un pequeño offset)
+    let shadow_origin = hit.point + hit.normal * EPS * 8.0;
+    let shadow_ray = Ray::new(shadow_origin, l_dir);
+    let mut in_shadow = false;
+
+    for obj in world.iter() {
+        if let Some(h) = obj.intersect(&shadow_ray, EPS, dist_to_light - EPS) {
+            if h.t > 0.0 { in_shadow = true; break; }
+        }
+    }
+
+    if in_shadow {
+        return ambient; // solo luz ambiente
+    }
+
+    // Difuso (Lambert)
+    let ndotl = hit.normal.dot(l_dir).max(0.0);
+    let diffuse = hit.material.albedo * ndotl * light.intensity;
+
+    // Especular (Phong)
+    let v = (cam_pos - hit.point).normalized();
+    let r = Vec3::reflect(-l_dir, hit.normal).normalized();
+    let spec = r.dot(v).max(0.0).powf(hit.material.shininess);
+    let specular = Vec3::splat(hit.material.ks * spec * light.intensity);
+
+    (ambient + diffuse + specular).hadamard(light.color)
+}
+
+/// Traza un píxel. Además, **escribe en zbuffer[idx]** la distancia al hit.
+pub fn trace_pixel(
+    x: i32, y: i32, w: i32, h: i32,
+    camera: &Camera,
+    world: &Vec<Box<dyn Hittable + Send + Sync>>,
+    light: &PointLight,
+    zbuffer: &mut [f32], idx: usize
+) -> Vec3 {
+    // 4 sub-muestras por píxel (2x2)
+    const SPP: usize = 4;
+    // offsets en el cuadrado del píxel (evita patrones)
+    let offsets: [(f32, f32); SPP] = [
+        (0.25, 0.25),
+        (0.75, 0.25),
+        (0.25, 0.75),
+        (0.75, 0.75),
+    ];
+
+    let mut accum = Vec3::new(0.0, 0.0, 0.0);
+    let mut best_t = INF;           // para el zbuffer guardamos el hit más cercano entre las submuestras
+    let mut have_hit_any = false;
+
+    for (ox, oy) in offsets {
+        let ray = camera.ray_for_pixel_offset(x, y, w, h, ox, oy);
+
+        let mut closest_t = INF;
+        let mut closest_hit: Option<HitRecord> = None;
+
+        for obj in world.iter() {
+            if let Some(hit) = obj.intersect(&ray, 0.001, closest_t) {
+                if hit.t < closest_t {
+                    closest_t = hit.t;
+                    closest_hit = Some(hit);
+                }
+            }
+        }
+
+        if let Some(hit) = closest_hit {
+            have_hit_any = true;
+            if hit.t < best_t { best_t = hit.t; }
+            accum = accum + shade(&hit, camera.eye, light, world);
+        } else {
+            accum = accum + background(ray.dir);
+        }
+    }
+
+    // z del píxel visible = mínimo t de las submuestras que pegaron
+    zbuffer[idx] = if have_hit_any { best_t } else { INF };
+
+    // promedio (en espacio lineal)
+    accum / (SPP as f32)
+}
+
+
+src\objects\cube.rs:
+use crate::material::Material;
+use crate::math::{Vec3, Ray, EPS, INF};
+use crate::object::{Hittable, HitRecord};
+
+/// Cubo AABB con centro y semiejes (half extents)
+pub struct Cube {
+    pub center: Vec3,
+    pub half: Vec3,
+    pub material: Material,
+}
+
+impl Cube {
+    pub fn new(center: Vec3, half_extents: Vec3, material: Material) -> Self {
+        Self { center, half: half_extents, material }
+    }
+}
+
+impl Hittable for Cube {
+    fn intersect(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord> {
+        // límites
+        let min_b = self.center - self.half;
+        let max_b = self.center + self.half;
+
+        // Método de slabs por eje
+        let mut tmin = t_min;
+        let mut tmax = t_max;
+
+        // X
+        let inv_dx = if ray.dir.x.abs() < EPS { INF } else { 1.0 / ray.dir.x };
+        let mut tx1 = (min_b.x - ray.origin.x) * inv_dx;
+        let mut tx2 = (max_b.x - ray.origin.x) * inv_dx;
+        if tx1 > tx2 { std::mem::swap(&mut tx1, &mut tx2); }
+        tmin = tmin.max(tx1);
+        tmax = tmax.min(tx2);
+        if tmax < tmin { return None; }
+
+        // Y
+        let inv_dy = if ray.dir.y.abs() < EPS { INF } else { 1.0 / ray.dir.y };
+        let mut ty1 = (min_b.y - ray.origin.y) * inv_dy;
+        let mut ty2 = (max_b.y - ray.origin.y) * inv_dy;
+        if ty1 > ty2 { std::mem::swap(&mut ty1, &mut ty2); }
+        tmin = tmin.max(ty1);
+        tmax = tmax.min(ty2);
+        if tmax < tmin { return None; }
+
+        // Z
+        let inv_dz = if ray.dir.z.abs() < EPS { INF } else { 1.0 / ray.dir.z };
+        let mut tz1 = (min_b.z - ray.origin.z) * inv_dz;
+        let mut tz2 = (max_b.z - ray.origin.z) * inv_dz;
+        if tz1 > tz2 { std::mem::swap(&mut tz1, &mut tz2); }
+        tmin = tmin.max(tz1);
+        tmax = tmax.min(tz2);
+        if tmax < tmin { return None; }
+
+        // Tomamos el primer cruce válido
+        let t_hit = if tmin > t_min { tmin } else { tmax };
+        if t_hit < t_min || t_hit > t_max { return None; }
+
+        let p = ray.at(t_hit);
+
+        // Normal según la cara tocada
+        let mut n = Vec3::new(0.0, 0.0, 0.0);
+        let bias = 1e-3;
+        if (p.x - max_b.x).abs() < bias { n = Vec3::new( 1.0, 0.0, 0.0); }
+        else if (p.x - min_b.x).abs() < bias { n = Vec3::new(-1.0, 0.0, 0.0); }
+        else if (p.y - max_b.y).abs() < bias { n = Vec3::new(0.0,  1.0, 0.0); }
+        else if (p.y - min_b.y).abs() < bias { n = Vec3::new(0.0, -1.0, 0.0); }
+        else if (p.z - max_b.z).abs() < bias { n = Vec3::new(0.0, 0.0,  1.0); }
+        else if (p.z - min_b.z).abs() < bias { n = Vec3::new(0.0, 0.0, -1.0); }
+
+        Some(HitRecord { t: t_hit, point: p, normal: n, material: self.material })
+    }
+}
+
+src\objects\mod.rs:
+pub mod cube;
+pub mod plane;
+
+src\objects\plane.rs:
+use crate::material::Material;
+use crate::math::{Vec3, Ray};
+use crate::object::{Hittable, HitRecord};
+
+/// Plano infinito (punto + normal)
+pub struct Plane {
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub material: Material,
+}
+
+impl Plane {
+    pub fn new(point: Vec3, normal: Vec3, material: Material) -> Self {
+        Self { point, normal: normal.normalized(), material }
+    }
+}
+
+impl Hittable for Plane {
+    fn intersect(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord> {
+        let denom = self.normal.dot(ray.dir);
+        if denom.abs() < 1e-6 { return None; } // paralelo
+
+        let t = (self.point - ray.origin).dot(self.normal) / denom;
+        if t < t_min || t > t_max { return None; }
+
+        let p = ray.at(t);
+        let n = if denom < 0.0 { self.normal } else { -self.normal };
+        Some(HitRecord { t, point: p, normal: n, material: self.material })
+    }
+}
+
